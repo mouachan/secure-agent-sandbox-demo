@@ -1,0 +1,123 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: chat-ui
+  namespace: agent-sandbox-demo
+  annotations:
+    serviceaccounts.openshift.io/oauth-redirecturi.chat: https://
+    serviceaccounts.openshift.io/oauth-redirectreference.chat: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"chat-ui"}}'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat-ui
+  namespace: agent-sandbox-demo
+  labels:
+    app: chat-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chat-ui
+  template:
+    metadata:
+      labels:
+        app: chat-ui
+    spec:
+      serviceAccountName: chat-ui
+      containers:
+      - name: oauth-proxy
+        image: registry.redhat.io/openshift4/ose-oauth-proxy-rhel9:v4.16
+        args:
+        - --https-address=:8443
+        - --provider=openshift
+        - --openshift-service-account=chat-ui
+        - --upstream=http://localhost:8081
+        - --tls-cert=/etc/tls/private/tls.crt
+        - --tls-key=/etc/tls/private/tls.key
+        - --cookie-secret-file=/etc/proxy/secrets/session_secret
+        - --pass-user-headers=true
+        ports:
+        - containerPort: 8443
+          name: https
+        volumeMounts:
+        - name: tls
+          mountPath: /etc/tls/private
+          readOnly: true
+        - name: proxy-secret
+          mountPath: /etc/proxy/secrets
+          readOnly: true
+      - name: chat
+        image: quay.io/mouachan/secure-agent-sandbox-chat:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8081
+          name: http
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: OPENSHELL_GATEWAY_ENDPOINT
+          value: "openshell.openshell.svc.cluster.local:8080"
+        - name: OPENSHELL_TLS_DIR
+          value: "/etc/openshell-tls"
+        - name: MAAS_URL
+          valueFrom:
+            secretKeyRef:
+              name: maas-credentials
+              key: url
+        - name: MAAS_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: maas-credentials
+              key: api_key
+        - name: MAAS_MODEL
+          valueFrom:
+            secretKeyRef:
+              name: maas-credentials
+              key: model
+              optional: true
+        volumeMounts:
+        - name: openshell-tls
+          mountPath: /etc/openshell-tls
+          readOnly: true
+      volumes:
+      - name: openshell-tls
+        secret:
+          secretName: openshell-client-tls
+      - name: tls
+        secret:
+          secretName: chat-ui-tls
+      - name: proxy-secret
+        secret:
+          secretName: chat-ui-proxy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chat-ui
+  namespace: agent-sandbox-demo
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: chat-ui-tls
+spec:
+  selector:
+    app: chat-ui
+  ports:
+  - name: https
+    port: 443
+    targetPort: 8443
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: chat-ui
+  namespace: agent-sandbox-demo
+spec:
+  to:
+    kind: Service
+    name: chat-ui
+  port:
+    targetPort: https
+  tls:
+    termination: reencrypt

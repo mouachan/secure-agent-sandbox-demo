@@ -1,0 +1,12 @@
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: agent-sandbox-demo
+spec:
+  spiffeIDTemplate: "spiffe://baremetal.openshift.itix.dev/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}"
+  podSelector:
+    matchLabels: {}
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: agent-sandbox-demo
+  ttl: "300s"
