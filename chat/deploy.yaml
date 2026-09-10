@@ -78,6 +78,16 @@ spec:
               name: maas-credentials
               key: model
               optional: true
+        - name: MLFLOW_TRACKING_URI
+          value: "https://<mlflow-route-host>/mlflow"
+        - name: MLFLOW_EXPERIMENT
+          value: "secure-agent-sandbox"
+        - name: MLFLOW_TRACKING_INSECURE_TLS
+          value: "true"
+        - name: OTEL_EXPORTER_OTLP_TRACES_INSECURE
+          value: "true"
+        - name: MLFLOW_TRACKING_TOKEN_FILE
+          value: "/var/run/secrets/kubernetes.io/serviceaccount/token"
         volumeMounts:
         - name: openshell-tls
           mountPath: /etc/openshell-tls

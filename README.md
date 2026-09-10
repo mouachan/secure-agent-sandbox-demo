@@ -488,6 +488,112 @@ Key rules:
 - `network_policies` are **dynamic** — hot-reloadable via `openshell policy set` without restarting the sandbox
 - `enforcement: enforce` blocks violations; `enforcement: audit` logs without blocking (useful for policy development)
 
+## End-to-End Traceability with MLflow
+
+Every interaction (Ask, Exfiltration) is traced end-to-end in MLflow on RHOAI. Traces include user identity, session, sandbox details, LLM metadata, proxy verdicts, and code execution results.
+
+### Architecture
+
+```
+Chat UI (FastAPI)
+  │
+  │  @mlflow.trace("sandbox_agent")
+  │
+  ├── sandbox_lookup (RETRIEVER)
+  │     user → label selector → sandbox name + id
+  │
+  ├── llm_inference (LLM)
+  │     question → model, prompt_tokens, completion_tokens,
+  │     total_tokens, duration_ms, generated_code, answer
+  │
+  ├── code_execution (TOOL)
+  │     code → result, exit_code, sandbox name
+  │
+  └── proxy_verdict (TOOL)
+        endpoint → ALLOWED/DENIED, policy name, engine=opa
+```
+
+### What gets tracked
+
+| Field | Where | Example |
+|---|---|---|
+| `session_id` | Trace | `mouachan-1789045441` |
+| `user` | Trace | `mouachan` |
+| `model` | Tag + LLM span | `qwen35-9b` |
+| `prompt_tokens` | LLM span attribute | `245` |
+| `completion_tokens` | LLM span attribute | `87` |
+| `total_tokens` | LLM span attribute | `332` |
+| `llm.duration_ms` | LLM span attribute | `1523` |
+| `sandbox` | RETRIEVER span output | `analyst-mouachan` |
+| `proxy.verdict` | TOOL span output | `ALLOWED` / `DENIED` |
+| `generated_code` | LLM span output | `total = sum(...)` |
+| `answer` | LLM span output | `AMER: 237600...` |
+| `agent` | Tag | `secure-analyst` |
+| `agent_version` | Tag | `1.0` |
+| `platform` | Tag | `RHOAI 3.5` |
+
+### Setup
+
+MLflow is deployed as a managed component in RHOAI 3.5 (`mlflowoperator: Managed` in DSC).
+
+**1. Create a Route for MLflow (if not exists):**
+
+```bash
+oc create route passthrough mlflow --service=mlflow --port=https -n redhat-ods-applications
+```
+
+**2. Grant the Chat UI ServiceAccount MLflow access:**
+
+```bash
+cat <<'EOF' | oc apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: chat-ui-mlflow-integration
+  namespace: agent-sandbox-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mlflow-operator-mlflow-integration
+subjects:
+- kind: ServiceAccount
+  name: chat-ui
+  namespace: agent-sandbox-demo
+EOF
+```
+
+**3. Configure environment variables in `chat/deploy.yaml`:**
+
+```yaml
+- name: MLFLOW_TRACKING_URI
+  value: "https://mlflow-redhat-ods-applications.apps.<cluster-domain>/mlflow"
+- name: MLFLOW_EXPERIMENT
+  value: "secure-agent-sandbox"
+- name: MLFLOW_TRACKING_INSECURE_TLS
+  value: "true"
+- name: MLFLOW_TRACKING_TOKEN_FILE
+  value: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+```
+
+MLflow uses `kubernetes-auth` with `self_subject_access_review` — the SA token is projected automatically by Kubernetes.
+
+### Viewing traces
+
+Open the RHOAI Dashboard → MLflow → workspace `agent-sandbox-demo` → experiment `secure-agent-sandbox`:
+- **Traces** tab: every Ask and Exfiltration with request/response preview
+- **Sessions** tab: grouped by user session, multi-turn conversation view
+- Click a trace to see the span tree: sandbox_lookup → llm_inference → code_execution → proxy_verdict
+
+### Demo flow with MLflow
+
+After running the sandbox demo (BLOCKED → policy → ALLOWED → exfil), switch to the MLflow UI:
+
+1. Show the **Sessions** tab — user session with multiple turns
+2. Click on an ALLOWED trace — show the span tree with LLM metadata (model, tokens, duration)
+3. Click on a BLOCKED trace — show the proxy_verdict span with `DENIED`
+4. Show the **Columns** button — add `model`, `prompt_tokens` columns to the trace list
+5. Narration: *"Every action the agent takes is traced — which model, how many tokens, what was allowed, what was blocked. Full audit trail in MLflow."*
+
 ## Honest Boundaries
 
 - Today the gateways authenticate by token; SVID-based validation at the gateways is the roadmap step
