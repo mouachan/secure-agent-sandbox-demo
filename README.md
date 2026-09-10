@@ -361,7 +361,7 @@ oc exec -n agent-sandbox-demo identity-demo -- bash -c \
   'cd /tmp && [ -f spire-agent ] || (curl -sSL https://github.com/spiffe/spire/releases/download/v1.15.2/spire-1.15.2-linux-amd64-musl.tar.gz | tar xzf - --strip-components=2 spire-1.15.2/bin/spire-agent) && mkdir -p svid && ./spire-agent api fetch x509 -socketPath /spiffe-workload-api/spire-agent.sock -write /tmp/svid/ && openssl x509 -in /tmp/svid/svid.0.pem -noout -subject -serial -dates -ext subjectAltName'
 ```
 
-**Money shot**: `URI:spiffe://baremetal.openshift.itix.dev/ns/agent-sandbox-demo/sa/default`
+**Money shot**: `URI:spiffe://<cluster-domain>/ns/agent-sandbox-demo/sa/default`
 
 ```bash
 # Delete and recreate → identity re-issued automatically
@@ -473,7 +473,7 @@ network_policies:
   maas_inference:
     name: maas-inference
     endpoints:
-      - host: maas.apps.ocp.cloud.rhai-tmm.dev
+      - host: <maas-hostname>
         port: 443
         protocol: rest
         enforcement: enforce

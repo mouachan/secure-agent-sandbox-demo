@@ -3,7 +3,7 @@ kind: ClusterSPIFFEID
 metadata:
   name: agent-sandbox-demo
 spec:
-  spiffeIDTemplate: "spiffe://baremetal.openshift.itix.dev/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}"
+  spiffeIDTemplate: "spiffe://<cluster-domain>/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}"
   podSelector:
     matchLabels: {}
   namespaceSelector:

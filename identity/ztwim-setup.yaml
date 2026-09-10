@@ -15,7 +15,7 @@ kind: ZeroTrustWorkloadIdentityManager
 metadata:
   name: cluster
 spec:
-  trustDomain: "baremetal.openshift.itix.dev"
+  trustDomain: "<cluster-domain>"
   clusterName: "baremetal"
 ---
 apiVersion: operator.openshift.io/v1alpha1
@@ -25,7 +25,7 @@ metadata:
 spec:
   logLevel: info
   logFormat: text
-  jwtIssuer: "https://spire-oidc.apps.baremetal.openshift.itix.dev"
+  jwtIssuer: "https://spire-oidc.apps.<cluster-domain>"
   caValidity: 24h
   defaultX509Validity: 1h
   defaultJWTValidity: 5m
@@ -71,4 +71,4 @@ metadata:
   name: cluster
 spec:
   logLevel: info
-  jwtIssuer: "https://spire-oidc.apps.baremetal.openshift.itix.dev"
+  jwtIssuer: "https://spire-oidc.apps.<cluster-domain>"

@@ -26,7 +26,7 @@ network_policies:
   maas_inference:
     name: maas-inference
     endpoints:
-      - host: maas.apps.ocp.cloud.rhai-tmm.dev
+      - host: <maas-hostname>
         port: 443
         protocol: rest
         enforcement: enforce

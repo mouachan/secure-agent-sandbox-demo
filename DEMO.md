@@ -36,7 +36,7 @@ oc exec -n agent-sandbox-demo identity-demo -- bash -c \
    openssl x509 -in /tmp/demo/svid.0.pem -noout -subject -serial -dates -ext subjectAltName'
 ```
 
-**Money shot**: `URI:spiffe://baremetal.openshift.itix.dev/ns/agent-sandbox-demo/sa/default`
+**Money shot**: `URI:spiffe://<cluster-domain>/ns/agent-sandbox-demo/sa/default`
 
 ### Step 3: Delete and recreate — auto re-issue
 
