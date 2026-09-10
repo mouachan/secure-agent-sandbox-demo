@@ -57,12 +57,29 @@ The supervisor and proxy are **not sidecars** — they run in the same container
 
 ## Prerequisites
 
-- OpenShift 4.19+ cluster with admin access
-- `oc` CLI authenticated
+### Cluster
+
+- OpenShift 4.19+ with admin access
+- **RHOAI 3.5** (Red Hat OpenShift AI) with the following DSC components enabled:
+  - `mlflowoperator: Managed` — MLflow for experiment tracking and tracing
+  - `dashboard: Managed` — RHOAI dashboard (MLflow UI access)
+  - `kserve: Managed` or a MaaS LLM endpoint available
+- **Operators from OperatorHub** (installed during deployment):
+  - `openshift-zero-trust-workload-identity-manager` (ZTWIM, GA) — SPIFFE/SPIRE workload identity
+  - `agent-sandbox-operator` (Tech Preview) — Sandbox pod lifecycle via `agents.x-k8s.io` CRDs
+
+### MaaS / LLM
+
+- A Model-as-a-Service endpoint exposing OpenAI-compatible `/v1/chat/completions`
+- API key for authentication
+- The model should support `chat_template_kwargs: {"enable_thinking": false}` if it's a thinking model (e.g., Qwen 3.5)
+
+### Local tools
+
+- `oc` CLI authenticated to the cluster
 - `openshell` CLI (`curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh`)
 - `helm` v3.17+
-- `podman` for container builds
-- A MaaS LLM endpoint (URL + API key)
+- `podman` for container builds (x86/amd64 cross-build on Mac)
 - A quay.io account for the Chat UI image
 
 ## Deployment Steps
