@@ -1,128 +1,76 @@
-# Secure Agent Sandbox Demo
+# Demo Quick Reference
 
-12-minute live demo: "An analyst agent that RUNS CODE, safely"
+Full documentation in [README.md](README.md). This is the cheat sheet.
 
-**Platform**: OpenShift 4.22 + RHOAI 3.5 + ZTWIM 1.1 + OpenShell
-**Cluster**: `<cluster-url>`
-
-## Prerequisites
+## Before the demo
 
 ```bash
-oc login --token=<your-token> --server=<cluster-url>
-oc project agent-sandbox-demo
-export MAAS_URL="<maas-chat-completions-url>"
-export MAAS_API_KEY="<your-api-key>"
-export MAAS_HOST="<maas-hostname>"
-export MAAS_MODEL="granite-3.3-8b-instruct"
-```
+# Verify everything
+openshell status
+openshell sandbox list
+oc get pod identity-demo -n agent-sandbox-demo
 
----
+# Create sandbox (if not exists)
+openshell sandbox delete analyst-mouachan 2>/dev/null
+openshell sandbox create --name analyst-mouachan --label owner=mouachan --detach
+openshell sandbox list   # wait for Ready
+```
 
 ## Module 1: Zero Trust Workload Identity (4 min)
 
-**Narration**: "Every workload on this cluster gets a cryptographic identity — not from a secret someone distributed, but from what the pod IS."
-
-### Step 1: Show the identity-demo pod
-
 ```bash
-oc get pod identity-demo -n agent-sandbox-demo
-```
+# Fetch SVID
+oc exec -n agent-sandbox-demo identity-demo -- bash -c 'cd /tmp && [ -f spire-agent ] || (curl -sSL https://github.com/spiffe/spire/releases/download/v1.15.2/spire-1.15.2-linux-amd64-musl.tar.gz | tar xzf - --strip-components=2 spire-1.15.2/bin/spire-agent) && mkdir -p svid && ./spire-agent api fetch x509 -socketPath /spiffe-workload-api/spire-agent.sock -write /tmp/svid/ && openssl x509 -in /tmp/svid/svid.0.pem -noout -subject -serial -dates -ext subjectAltName'
 
-### Step 2: Fetch the SVID
-
-```bash
-oc exec -n agent-sandbox-demo identity-demo -- bash -c \
-  '/tmp/spire-agent api fetch x509 -socketPath /spiffe-workload-api/spire-agent.sock -write /tmp/demo/ && \
-   openssl x509 -in /tmp/demo/svid.0.pem -noout -subject -serial -dates -ext subjectAltName'
-```
-
-**Money shot**: `URI:spiffe://<cluster-domain>/ns/agent-sandbox-demo/sa/default`
-
-### Step 3: Delete and recreate — auto re-issue
-
-```bash
-oc delete pod identity-demo -n agent-sandbox-demo --wait=true
+# Delete + recreate → new serial
+oc delete pod identity-demo -n agent-sandbox-demo --wait
 oc apply -f identity/identity-demo.yaml
 sleep 15
-oc exec -n agent-sandbox-demo identity-demo -- bash -c \
-  'cd /tmp && curl -sSL https://github.com/spiffe/spire/releases/download/v1.15.2/spire-1.15.2-linux-amd64-musl.tar.gz 2>/dev/null | \
-   tar xzf - --strip-components=2 spire-1.15.2/bin/spire-agent && \
-   mkdir -p /tmp/demo && ./spire-agent api fetch x509 -socketPath /spiffe-workload-api/spire-agent.sock -write /tmp/demo/ && \
-   openssl x509 -in /tmp/demo/svid.0.pem -noout -serial -dates -ext subjectAltName'
+
+# Re-fetch → different serial = auto re-issued
+oc exec -n agent-sandbox-demo identity-demo -- bash -c 'cd /tmp && [ -f spire-agent ] || (curl -sSL https://github.com/spiffe/spire/releases/download/v1.15.2/spire-1.15.2-linux-amd64-musl.tar.gz | tar xzf - --strip-components=2 spire-1.15.2/bin/spire-agent) && mkdir -p svid && ./spire-agent api fetch x509 -socketPath /spiffe-workload-api/spire-agent.sock -write /tmp/svid/ && openssl x509 -in /tmp/svid/svid.0.pem -noout -serial -dates -ext subjectAltName'
 ```
-
-**Money shot**: New serial, new validity window. Zero human action.
-
-**Narration**: "22,000 workloads, zero credentials distributed."
-
----
 
 ## Module 2: Secure Agent Sandbox (5 min)
 
-**Narration**: "Now let's run an AI agent that executes code — safely."
-
-### Step 1: Create sandbox from policy
-
+**Terminal 1** — audit logs:
 ```bash
-openshell sandbox create --policy policies/analyst.yaml --name analyst-sandbox
+openshell logs analyst-mouachan --tail --source sandbox | grep "ALLOWED\|DENIED"
 ```
 
-### Step 2: Run the analyst agent (real answer from real data)
-
+**Terminal 2** — sandbox info:
 ```bash
-openshell sandbox exec analyst-sandbox -- python3 /agent/analyst.py "What is the total revenue by region?"
+openshell sandbox list
+openshell policy get analyst-mouachan --full -o json
 ```
 
-**Money shot**: LLM generates pandas code → executes → prints the answer.
+**Browser** — Chat UI:
+1. Open `https://chat-ui-agent-sandbox-demo.apps.<cluster-domain>`
+2. Login via OAuth
+3. **Ask** → BLOCKED (no policy yet)
+4. Terminal 1 shows `DENIED python3.14 → maas...:443`
 
-### Step 3: Exfiltration test (BLOCKED)
-
+**Terminal 2** — apply policy:
 ```bash
-openshell sandbox exec analyst-sandbox -- bash /agent/exfil_test.sh
+openshell policy set analyst-mouachan --policy policies/analyst.yaml --wait
 ```
 
-**Money shot**: `BLOCKED: Outbound connection denied by sandbox policy.`
+**Browser**:
+5. **Ask** again → ALLOWED + code + result
+6. Terminal 1 shows `ALLOWED python3.14 → maas...:443`
+7. **Try Exfiltration** → BLOCKED
+8. Terminal 1 shows `DENIED python3.14 → evil.example.com:443`
 
-### Step 4: Show the audit log
+## Module 3: MLflow Traceability (3 min)
 
-```bash
-openshell sandbox logs analyst-sandbox --audit
-```
+Open RHOAI Dashboard → MLflow → workspace `agent-sandbox-demo` → experiment `secure-agent-sandbox`:
+1. **Sessions** tab — user session with turns
+2. Click ALLOWED trace → span tree: sandbox_lookup → llm_inference (model, tokens) → code_execution → proxy_verdict
+3. Click BLOCKED trace → proxy_verdict: DENIED
+4. **Columns** → add model, tokens
 
-**Money shot**: Green ALLOWED line for MaaS, red BLOCKED line for evil.example.com.
-
-### Step 5: Destroy sandbox
-
-```bash
-openshell sandbox destroy analyst-sandbox
-```
-
----
-
-## Module 3: Chat UI (3 min, if time permits)
-
-**Narration**: "Same security boundary, interactive interface."
+## Cleanup
 
 ```bash
-cd chat && python3 -m uvicorn app:app --host 0.0.0.0 --port 8080
-```
-
-Open `http://localhost:8080` — ask a question, see generated code + result + proxy verdict.
-Click "Try Exfiltration" — red BLOCKED badge.
-
----
-
-## Honest Boundaries
-
-- Today the gateways authenticate by token; SVID-based validation at the gateways is the roadmap step.
-- We show the identity layer working, not pretend the whole chain is wired end-to-end.
-- OpenShell integration with RHOAI is planned; today we use upstream OpenShell with the Kubernetes driver.
-
-## Recording
-
-```bash
-./record.sh identity   # Record identity module
-./record.sh sandbox    # Record sandbox module
-./record.sh chat       # Record chat module
-./record.sh all        # Record everything
+openshell sandbox delete analyst-mouachan
 ```
